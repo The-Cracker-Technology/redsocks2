@@ -3,8 +3,8 @@
  *
  * This code is based on redsocks project developed by Leonid Evdokimov.
  * Licensed under the Apache License, Version 2.0 (the "License").
- * 
- * 
+ *
+ *
  * Copyright (C) 2007-2011 Leonid Evdokimov <leon@darkk.net.ru>
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -56,7 +56,9 @@ extern relay_subsys https_connect_subsys;
 extern relay_subsys http_relay_subsys;
 extern relay_subsys socks4_subsys;
 extern relay_subsys socks5_subsys;
+#if !defined(DISABLE_SHADOWSOCKS)
 extern relay_subsys shadowsocks_subsys;
+#endif
 static relay_subsys *relay_subsystems[] =
 {
     &direct_connect_subsys,
@@ -64,7 +66,9 @@ static relay_subsys *relay_subsystems[] =
     &http_relay_subsys,
     &socks4_subsys,
     &socks5_subsys,
+#if !defined(DISABLE_SHADOWSOCKS)
     &shadowsocks_subsys,
+#endif
 #if defined(ENABLE_HTTPS_PROXY)
     &https_connect_subsys,
 #endif
@@ -75,11 +79,9 @@ static list_head instances = LIST_HEAD_INIT(instances);
 
 static parser_entry redsocks_entries[] =
 {
-    { .key = "local_ip",   .type = pt_in_addr },
-    { .key = "local_port", .type = pt_uint16 },
+    { .key = "bind",       .type = pt_pchar },
     { .key = "interface",  .type = pt_pchar },
-    { .key = "ip",         .type = pt_in_addr },
-    { .key = "port",       .type = pt_uint16 },
+    { .key = "relay",      .type = pt_pchar },
     { .key = "type",       .type = pt_pchar },
     { .key = "login",      .type = pt_pchar },
     { .key = "password",   .type = pt_pchar },
@@ -150,10 +152,9 @@ static int redsocks_onenter(parser_section *section)
 
     INIT_LIST_HEAD(&instance->list);
     INIT_LIST_HEAD(&instance->clients);
-    instance->config.bindaddr.sin_family = AF_INET;
-    instance->config.bindaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    instance->config.relayaddr.sin_family = AF_INET;
-    instance->config.relayaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct sockaddr_in * addr = (struct sockaddr_in *)&instance->config.bindaddr;
+    addr->sin_family = AF_INET;
+    addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     /* Default value can be checked in run-time, but I doubt anyone needs that.
      * Linux:   sysctl net.core.somaxconn
      * FreeBSD: sysctl kern.ipc.somaxconn */
@@ -165,11 +166,9 @@ static int redsocks_onenter(parser_section *section)
 
     for (parser_entry *entry = &section->entries[0]; entry->key; entry++)
         entry->addr =
-            (strcmp(entry->key, "local_ip") == 0)   ? (void*)&instance->config.bindaddr.sin_addr :
-            (strcmp(entry->key, "local_port") == 0) ? (void*)&instance->config.bindaddr.sin_port :
             (strcmp(entry->key, "interface") == 0)  ? (void*)&instance->config.interface :
-            (strcmp(entry->key, "ip") == 0)         ? (void*)&instance->config.relayaddr.sin_addr :
-            (strcmp(entry->key, "port") == 0)       ? (void*)&instance->config.relayaddr.sin_port :
+            (strcmp(entry->key, "bind") == 0)       ? (void*)&instance->config.bind :
+            (strcmp(entry->key, "relay") == 0)      ? (void*)&instance->config.relay :
             (strcmp(entry->key, "type") == 0)       ? (void*)&instance->config.type :
             (strcmp(entry->key, "login") == 0)      ? (void*)&instance->config.login :
             (strcmp(entry->key, "password") == 0)   ? (void*)&instance->config.password :
@@ -179,7 +178,7 @@ static int redsocks_onenter(parser_section *section)
             (strcmp(entry->key, "autoproxy") == 0) ? (void*)&instance->config.autoproxy :
             (strcmp(entry->key, "timeout") == 0) ? (void*)&instance->config.timeout:
             NULL;
-    section->data = instance;   
+    section->data = instance;
     return 0;
 }
 
@@ -196,10 +195,21 @@ static int redsocks_onexit(parser_section *section)
     for (parser_entry *entry = &section->entries[0]; entry->key; entry++)
         entry->addr = NULL;
 
-    instance->config.bindaddr.sin_port = htons(instance->config.bindaddr.sin_port);
-    instance->config.relayaddr.sin_port = htons(instance->config.relayaddr.sin_port);
+    // Parse and update bind address and relay address
+    if (instance->config.bind) {
+        struct sockaddr * addr = (struct sockaddr *)&instance->config.bindaddr;
+        int addr_size = sizeof(instance->config.bindaddr);
+        if (evutil_parse_sockaddr_port(instance->config.bind, addr, &addr_size))
+            err = "invalid bind address";
+    }
+    if (!err && instance->config.relay) {
+        struct sockaddr * addr = (struct sockaddr *)&instance->config.relayaddr;
+        int addr_size = sizeof(instance->config.relayaddr);
+        if (evutil_parse_sockaddr_port(instance->config.relay, addr, &addr_size))
+            err = "invalid relay address";
+    }
 
-    if (instance->config.type) {
+    if (!err && instance->config.type) {
         relay_subsys **ss;
         FOREACH(ss, relay_subsystems) {
             if (!strcmp((*ss)->name, instance->config.type)) {
@@ -245,7 +255,8 @@ static parser_section redsocks_conf_section =
 
 void redsocks_log_write_plain(
         const char *file, int line, const char *func, int do_errno,
-        const struct sockaddr_in *clientaddr, const struct sockaddr_in *destaddr,
+        const struct sockaddr_storage *clientaddr,
+        const struct sockaddr_storage *destaddr,
         int priority, const char *orig_fmt, ...
 ) {
     int saved_errno = errno;
@@ -274,8 +285,8 @@ void redsocks_touch_client(redsocks_client *client)
 
 static inline const char* bufname(redsocks_client *client, struct bufferevent *buf)
 {
-	assert(buf == client->client || buf == client->relay);
-	return buf == client->client ? "client" : "relay";
+    assert(buf == client->client || buf == client->relay);
+    return buf == client->client ? "client" : "relay";
 }
 
 static void redsocks_relay_readcb(redsocks_client *client, struct bufferevent *from, struct bufferevent *to)
@@ -387,9 +398,9 @@ int redsocks_start_relay(redsocks_client *client)
                                      event_cb,
                                      client);
 
-    error = bufferevent_enable(client->client, 
-                client->client_evshut == EV_READ ? EV_WRITE : 
-                client->client_evshut == EV_WRITE ? EV_READ : 
+    error = bufferevent_enable(client->client,
+                client->client_evshut == EV_READ ? EV_WRITE :
+                client->client_evshut == EV_WRITE ? EV_READ :
                 client->client_evshut == (EV_READ|EV_WRITE) ? 0 : EV_READ | EV_WRITE);
     if (!error)
         error = bufferevent_enable(client->relay, EV_READ | EV_WRITE);
@@ -506,7 +517,7 @@ void redsocks_event_error(struct bufferevent *buffev, short what, void *_arg)
 
     if (!(what & BEV_EVENT_ERROR))
         errno = redsocks_socket_geterrno(client, buffev);
-    redsocks_log_errno(client, LOG_DEBUG, "%s, what: " event_fmt_str, 
+    redsocks_log_errno(client, LOG_DEBUG, "%s, what: " event_fmt_str,
                             buffev == client->client?"client":"relay",
                             event_fmt(what));
 
@@ -673,8 +684,9 @@ int redsocks_connect_relay(redsocks_client *client)
     tv.tv_usec = 0;
 
     // Allowing binding relay socket to specified IP for outgoing connections
-    client->relay = red_connect_relay(interface, &client->instance->config.relayaddr,
-                                      NULL, 
+    client->relay = red_connect_relay(interface,
+                                      &client->instance->config.relayaddr,
+                                      NULL,
                                       redsocks_relay_connected,
                                       redsocks_event_error, client, &tv);
     if (!client->relay) {
@@ -728,10 +740,10 @@ static void redsocks_accept_client(int fd, short what, void *_arg)
 {
     redsocks_instance *self = _arg;
     redsocks_client   *client = NULL;
-    struct sockaddr_in clientaddr;
-    struct sockaddr_in myaddr;
-    struct sockaddr_in destaddr;
-    socklen_t          addrlen = sizeof(clientaddr);
+    struct sockaddr_storage clientaddr;
+    struct sockaddr_storage myaddr;
+    struct sockaddr_storage destaddr;
+    socklen_t addrlen = sizeof(clientaddr);
     int client_fd = -1;
     int error;
 
@@ -782,7 +794,7 @@ static void redsocks_accept_client(int fd, short what, void *_arg)
 
     // everything seems to be ok, let's allocate some memory
     if (self->config.autoproxy)
-        client = calloc(1, sizeof(redsocks_client) + 
+        client = calloc(1, sizeof(redsocks_client) +
                             self->relay_ss->payload_len + autoproxy_subsys.payload_len
                             );
     else
@@ -809,9 +821,9 @@ static void redsocks_accept_client(int fd, short what, void *_arg)
     if (!client->client) {
         log_errno(LOG_ERR, "bufferevent_socket_new");
         goto fail;
-    }   
+    }
     bufferevent_setcb(client->client, NULL, NULL, redsocks_event_error, client);
-    
+
     client_fd = -1;
 
     // enable reading to handle EOF from client
@@ -893,7 +905,7 @@ static void redsocks_dump_instance(redsocks_instance *instance)
               red_inet_ntop(&instance->config.bindaddr, addr_str, sizeof(addr_str)));
     list_for_each_entry(client, &instance->clients, list)
         redsocks_dump_client(client, LOG_INFO);
-    
+
     log_error(LOG_INFO, "End of client list.");
 }
 
@@ -905,9 +917,9 @@ static void redsocks_debug_dump()
         redsocks_dump_instance(instance);
 }
 
-/* Audit is required to clean up hung connections. 
+/* Audit is required to clean up hung connections.
  * Not all connections are closed gracefully by both ends. In any case that
- * either far end of client or far end of relay does not close connection 
+ * either far end of client or far end of relay does not close connection
  * gracefully, we got hung connections.
  */
 static void redsocks_audit_instance(redsocks_instance *instance)
@@ -925,7 +937,7 @@ static void redsocks_audit_instance(redsocks_instance *instance)
 
         if (now - client->last_event >= REDSOCKS_AUDIT_INTERVAL){
             /* Only take actions if no touch of the client for at least an audit cycle.*/
-            /* drop this client if either end disconnected */   
+            /* drop this client if either end disconnected */
             if ((client->client_evshut == EV_WRITE && client->relay_evshut == EV_READ)
                 || (client->client_evshut == EV_READ && client->relay_evshut == EV_WRITE)
                 || (client->client_evshut == (EV_READ|EV_WRITE) && client->relay_evshut == EV_WRITE)
@@ -961,15 +973,16 @@ static int redsocks_init_instance(redsocks_instance *instance)
      *        looks ugly.
      */
     int error;
+    int bindaddr_len = 0;
     evutil_socket_t fd = -1;
 
-    if (instance->relay_ss->instance_init 
+    if (instance->relay_ss->instance_init
         && instance->relay_ss->instance_init(instance)) {
         log_errno(LOG_ERR, "Failed to init relay subsystem.");
         goto fail;
-    } 
+    }
 
-    fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    fd = socket(instance->config.bindaddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (fd == -1) {
         log_errno(LOG_ERR, "socket");
         goto fail;
@@ -985,7 +998,15 @@ static int redsocks_init_instance(redsocks_instance *instance)
     if (make_socket_transparent(fd))
         log_error(LOG_WARNING, "Continue without TPROXY support");
 
-    error = bind(fd, (struct sockaddr*)&instance->config.bindaddr, sizeof(instance->config.bindaddr));
+//    if (apply_reuseport(fd))
+//        log_error(LOG_WARNING, "Continue without SO_REUSEPORT enabled");
+
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    bindaddr_len = instance->config.bindaddr.ss_len > 0 ? instance->config.bindaddr.ss_len : sizeof(instance->config.bindaddr);
+#else
+    bindaddr_len = sizeof(instance->config.bindaddr);
+#endif
+    error = bind(fd, (struct sockaddr*)&instance->config.bindaddr, bindaddr_len);
     if (error) {
         log_errno(LOG_ERR, "bind");
         goto fail;

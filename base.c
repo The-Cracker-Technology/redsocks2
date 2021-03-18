@@ -57,11 +57,12 @@
 #include "main.h"
 #include "parser.h"
 #include "redsocks.h"
+#include "utils.h"
 
 typedef struct redirector_subsys_t {
 	int (*init)();
 	void (*fini)();
-	int (*getdestaddr)(int fd, const struct sockaddr_in *client, const struct sockaddr_in *bindaddr, struct sockaddr_in *destaddr);
+	int (*getdestaddr)(int fd, const struct sockaddr_storage *client, const struct sockaddr_storage *bindaddr, struct sockaddr_storage *destaddr);
 	const char *name;
 	// some subsystems may store data here:
 	int private;
@@ -78,6 +79,9 @@ typedef struct base_instance_t {
 	bool log_debug;
 	bool log_info;
 	bool daemon;
+#ifdef SO_REUSEPORT
+	bool reuseport;
+#endif
 #if defined(TCP_KEEPIDLE) && defined(TCP_KEEPCNT) && defined(TCP_KEEPINTVL)
 	uint16_t tcp_keepalive_time;
 	uint16_t tcp_keepalive_probes;
@@ -121,10 +125,13 @@ static int redir_init_ipf()
 	return redir_open_private(fname, O_RDONLY);
 }
 
-static int getdestaddr_ipf(int fd, const struct sockaddr_in *client, const struct sockaddr_in *bindaddr, struct sockaddr_in *destaddr)
+static int getdestaddr_ipf(int fd,
+	const struct sockaddr_storage *client,
+	const struct sockaddr_storage *bindaddr,
+	struct sockaddr_storage *destaddr)
 {
 	int natfd = instance.redirector->private;
-	struct natlookup natLookup;
+	struct natlookup nl;
 	int x;
 #if defined(IPFILTER_VERSION) && (IPFILTER_VERSION >= 4000027)
 	struct ipfobj obj;
@@ -134,17 +141,17 @@ static int getdestaddr_ipf(int fd, const struct sockaddr_in *client, const struc
 
 #if defined(IPFILTER_VERSION) && (IPFILTER_VERSION >= 4000027)
 	obj.ipfo_rev = IPFILTER_VERSION;
-	obj.ipfo_size = sizeof(natLookup);
-	obj.ipfo_ptr = &natLookup;
+	obj.ipfo_size = sizeof(nl);
+	obj.ipfo_ptr = &nl;
 	obj.ipfo_type = IPFOBJ_NATLOOKUP;
 	obj.ipfo_offset = 0;
 #endif
 
-	natLookup.nl_inport = bindaddr->sin_port;
-	natLookup.nl_outport = client->sin_port;
-	natLookup.nl_inip = bindaddr->sin_addr;
-	natLookup.nl_outip = client->sin_addr;
-	natLookup.nl_flags = IPN_TCP;
+	nl.nl_inport = ((struct sockaddr_in *)bindaddr)->sin_port;
+	nl.nl_outport = ((struct sockaddr_in *)client)->sin_port;
+	nl.nl_inip = ((struct sockaddr_in *)bindaddr)->sin_addr;
+	nl.nl_outip = ((struct sockaddr_in *)client)->sin_addr;
+	nl.nl_flags = IPN_TCP;
 #if defined(IPFILTER_VERSION) && (IPFILTER_VERSION >= 4000027)
 	x = ioctl(natfd, SIOCGNATL, &obj);
 #else
@@ -156,10 +163,10 @@ static int getdestaddr_ipf(int fd, const struct sockaddr_in *client, const struc
 	 * this seems simpler.
 	 */
 	if (63 == siocgnatl_cmd) {
-		struct natlookup *nlp = &natLookup;
+		struct natlookup *nlp = &nl;
 		x = ioctl(natfd, SIOCGNATL, &nlp);
 	} else {
-		x = ioctl(natfd, SIOCGNATL, &natLookup);
+		x = ioctl(natfd, SIOCGNATL, &nl);
 	}
 #endif
 	if (x < 0) {
@@ -167,9 +174,9 @@ static int getdestaddr_ipf(int fd, const struct sockaddr_in *client, const struc
 			log_errno(LOG_WARNING, "ioctl(SIOCGNATL)\n");
 		return -1;
 	} else {
-		destaddr->sin_family = AF_INET;
-		destaddr->sin_port = natLookup.nl_realport;
-		destaddr->sin_addr = natLookup.nl_realip;
+		destaddr->ss_family = AF_INET;
+		((struct sockaddr_in *)destaddr)->sin_port = nl.nl_realport;
+		((struct sockaddr_in *)destaddr)->sin_addr = nl.nl_realip;
 		return 0;
 	}
 }
@@ -181,21 +188,42 @@ static int redir_init_pf()
 	return redir_open_private("/dev/pf", O_RDWR);
 }
 
+// FIXME: Support IPv6
 static int getdestaddr_pf(
-		int fd, const struct sockaddr_in *client, const struct sockaddr_in *bindaddr,
-		struct sockaddr_in *destaddr)
+		int fd,
+		const struct sockaddr_storage *client,
+		const struct sockaddr_storage *bindaddr,
+		struct sockaddr_storage *destaddr)
 {
 	int pffd = instance.redirector->private;
 	struct pfioc_natlook nl;
 	int saved_errno;
-	char clientaddr_str[INET6_ADDRSTRLEN], bindaddr_str[INET6_ADDRSTRLEN];
+    char clientaddr_str[RED_INET_ADDRSTRLEN], bindaddr_str[RED_INET_ADDRSTRLEN];
 
 	memset(&nl, 0, sizeof(struct pfioc_natlook));
-	nl.saddr.v4.s_addr = client->sin_addr.s_addr;
-	nl.sport = client->sin_port;
-	nl.daddr.v4.s_addr = bindaddr->sin_addr.s_addr;
-	nl.dport = bindaddr->sin_port;
-	nl.af = AF_INET;
+	if (client->ss_family == AF_INET) {
+		nl.saddr.v4 = ((const struct sockaddr_in *)client)->sin_addr;
+		nl.sport = ((struct sockaddr_in *)client)->sin_port;
+	}
+	else if (client->ss_family == AF_INET6) {
+		memcpy(&nl.saddr.v6, &((const struct sockaddr_in6 *)client)->sin6_addr, sizeof(struct in6_addr));
+		nl.sport = ((struct sockaddr_in6 *)client)->sin6_port;
+	}
+	else {
+		goto fail;
+	}
+	if (bindaddr->ss_family == AF_INET) {
+		nl.daddr.v4 = ((const struct sockaddr_in *)bindaddr)->sin_addr;
+		nl.dport = ((struct sockaddr_in *)bindaddr)->sin_port;
+	}
+	else if (bindaddr->ss_family == AF_INET6) {
+		memcpy(&nl.daddr.v6, &((const struct sockaddr_in6 *)bindaddr)->sin6_addr, sizeof(struct in6_addr));
+		nl.dport = ((struct sockaddr_in6 *)bindaddr)->sin6_port;
+	}
+	else {
+		goto fail;
+	}
+	nl.af = client->ss_family;  // Use same address family ass client
 	nl.proto = IPPROTO_TCP;
 	nl.direction = PF_OUT;
 
@@ -210,32 +238,50 @@ static int getdestaddr_pf(
 			goto fail;
 		}
 	}
-	destaddr->sin_family = AF_INET;
-	destaddr->sin_port = nl.rdport;
-	destaddr->sin_addr = nl.rdaddr.v4;
+	destaddr->ss_family = nl.af;
+	if (nl.af == AF_INET) {
+		((struct sockaddr_in *)destaddr)->sin_port = nl.rdport;
+		((struct sockaddr_in *)destaddr)->sin_addr = nl.rdaddr.v4;
+	}
+	else {
+		((struct sockaddr_in6 *)destaddr)->sin6_port = nl.rdport;
+		memcpy(&(((struct sockaddr_in6 *)destaddr)->sin6_addr), &nl.rdaddr.v6, sizeof(struct in6_addr));
+	}
 	return 0;
 
 fail:
 	saved_errno = errno;
-	if (!inet_ntop(client->sin_family, &client->sin_addr, clientaddr_str, sizeof(clientaddr_str)))
-		strncpy(clientaddr_str, "???", sizeof(clientaddr_str));
-	if (!inet_ntop(bindaddr->sin_family, &bindaddr->sin_addr, bindaddr_str, sizeof(bindaddr_str)))
-		strncpy(bindaddr_str, "???", sizeof(bindaddr_str));
-
+	red_inet_ntop(client, clientaddr_str, sizeof(clientaddr_str));
+	red_inet_ntop(bindaddr, bindaddr_str, sizeof(bindaddr_str));
 	errno = saved_errno;
-	log_errno(LOG_WARNING, "ioctl(DIOCNATLOOK {src=%s:%d, dst=%s:%d})",
-			  clientaddr_str, ntohs(nl.sport), bindaddr_str, ntohs(nl.dport));
+	log_errno(LOG_WARNING, "ioctl(DIOCNATLOOK {src=%s, dst=%s})",
+			  clientaddr_str, bindaddr_str);
 	return -1;
 }
 #endif
 
 #ifdef USE_IPTABLES
-static int getdestaddr_iptables(int fd, const struct sockaddr_in *client, const struct sockaddr_in *bindaddr, struct sockaddr_in *destaddr)
+static int getdestaddr_iptables(
+	int fd,
+	const struct sockaddr_storage *client,
+	const struct sockaddr_storage *bindaddr,
+	struct sockaddr_storage *destaddr)
 {
 	socklen_t socklen = sizeof(*destaddr);
 	int error;
 
-	error = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, destaddr, &socklen);
+#ifdef SOL_IPV6
+	int sol = (client->ss_family == AF_INET6) ? SOL_IPV6 : SOL_IP;
+#else
+	int sol = SOL_IP;
+#endif
+	error = getsockopt(fd, sol, SO_ORIGINAL_DST, destaddr, &socklen);
+#ifdef SOL_IPV6
+	if (error && sol == SOL_IPV6) {
+		sol = SOL_IP;
+		error = getsockopt(fd, sol, SO_ORIGINAL_DST, destaddr, &socklen);
+	}
+#endif
 	if (error) {
 		log_errno(LOG_WARNING, "getsockopt");
 		return -1;
@@ -244,7 +290,11 @@ static int getdestaddr_iptables(int fd, const struct sockaddr_in *client, const 
 }
 #endif
 
-static int getdestaddr_generic(int fd, const struct sockaddr_in *client, const struct sockaddr_in *bindaddr, struct sockaddr_in *destaddr)
+static int getdestaddr_generic(
+	int fd,
+	const struct sockaddr_storage *client,
+	const struct sockaddr_storage *bindaddr,
+	struct sockaddr_storage *destaddr)
 {
 	socklen_t socklen = sizeof(*destaddr);
 	int error;
@@ -257,7 +307,11 @@ static int getdestaddr_generic(int fd, const struct sockaddr_in *client, const s
 	return 0;
 }
 
-int getdestaddr(int fd, const struct sockaddr_in *client, const struct sockaddr_in *bindaddr, struct sockaddr_in *destaddr)
+int getdestaddr(
+	int fd,
+	const struct sockaddr_storage *client,
+	const struct sockaddr_storage *bindaddr,
+	struct sockaddr_storage *destaddr)
 {
 	return instance.redirector->getdestaddr(fd, client, bindaddr, destaddr);
 }
@@ -282,6 +336,22 @@ int apply_tcp_keepalive(int fd)
 		}
 	}
 	return 0;
+}
+
+int apply_reuseport(int fd)
+{
+#ifdef SO_REUSEPORT
+    if (!instance.reuseport)
+        return 0;
+
+    int opt = 1;
+    int rc = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    if (rc == -1)
+        log_errno(LOG_ERR, "setsockopt");
+    return rc;
+#else
+    return -1;
+#endif
 }
 
 static redirector_subsys redirector_subsystems[] =
@@ -315,6 +385,9 @@ static parser_entry base_entries[] =
 	{ .key = "tcp_keepalive_time",   .type = pt_uint16, .addr = &instance.tcp_keepalive_time },
 	{ .key = "tcp_keepalive_probes", .type = pt_uint16, .addr = &instance.tcp_keepalive_probes },
 	{ .key = "tcp_keepalive_intvl",  .type = pt_uint16, .addr = &instance.tcp_keepalive_intvl },
+#endif
+#ifdef SO_REUSEPORT
+	{ .key = "reuseport",  .type = pt_bool,    .addr = &instance.reuseport},
 #endif
 	{ }
 };

@@ -1,18 +1,29 @@
+ifdef DISABLE_SHADOWSOCKS
+OBJS := parser.o main.o redsocks.o log.o direct.o ipcache.o autoproxy.o http-connect.o \
+        socks4.o socks5.o http-relay.o base.o base64.o md5.o http-auth.o utils.o redudp.o socks5-udp.o \
+        tcpdns.o gen/version.o
+CFLAGS +=-fPIC -O3 -DDISABLE_SHADOWSOCKS
+FEATURES += DISABLE_SHADOWSOCKS
+else
 OBJS := parser.o main.o redsocks.o log.o direct.o ipcache.o autoproxy.o encrypt.o shadowsocks.o http-connect.o \
         socks4.o socks5.o http-relay.o base.o base64.o md5.o http-auth.o utils.o redudp.o socks5-udp.o shadowsocks-udp.o \
         tcpdns.o gen/version.o
+CFLAGS +=-fPIC -O3
+endif
 SRCS := $(OBJS:.o=.c)
 CONF := config.h
 DEPS := .depend
 OUT := redsocks2
-VERSION := 0.66
+VERSION := 0.68
 OS := $(shell uname)
 
 LIBS := -levent
-CFLAGS +=-fPIC -O3
 override CFLAGS += -D_BSD_SOURCE -D_DEFAULT_SOURCE -Wall
 ifeq ($(OS), Linux)
 override CFLAGS += -std=c99 -D_XOPEN_SOURCE=600
+endif
+ifeq ($(OS), FreeBSD)
+override CFLAGS +=-I/usr/local/include -L/usr/local//lib
 endif
 ifeq ($(OS), Darwin)
 override CFLAGS +=-I/usr/local/opt/openssl/include -L/usr/local/opt/openssl/lib
@@ -38,14 +49,16 @@ ifdef ENABLE_HTTPS_PROXY
 override OBJS += https-connect.o
 override LIBS += -levent_openssl
 override CFLAGS += -DENABLE_HTTPS_PROXY
+override FEATURES += ENABLE_HTTPS_PROXY
 $(info Compile with HTTPS proxy enabled.)
 endif
-override LIBS += -lssl -lcrypto
+override LIBS += -lssl -lcrypto -ldl
 override CFLAGS += -DUSE_CRYPTO_OPENSSL
 endif
 ifdef ENABLE_STATIC
-override LIBS += -ldl -lz
+override LIBS += -lz
 override LDFLAGS += -Wl,-static -static -static-libgcc -s
+override FEATURES += STATIC_COMPILE
 endif
 
 all: $(OUT)
@@ -83,6 +96,8 @@ gen/version.c: *.c *.h gen/.build
 	echo 'const char* redsocks_version = ' >> $@.tmp
 	if [ -d .git ]; then \
 		echo '"redsocks/$(VERSION) $(CRYPTO)"'; \
+		echo '"\\n"'; \
+		echo '"Features: $(FEATURES)"'; \
 	fi >> $@.tmp
 	echo ';' >> $@.tmp
 	mv -f $@.tmp $@
@@ -95,11 +110,11 @@ base.c: $(CONF)
 
 ifeq ($(OS), Darwin)
 $(OSX_HEADERS_PATH)/net/pfvar.h:
-	mkdir -p $(OSX_HEADERS_PATH)/net && curl -o $(OSX_HEADERS_PATH)/net/pfvar.h https://raw.githubusercontent.com/opensource-apple/xnu/$(OSX_VERSION)/bsd/net/pfvar.h
+	mkdir -p $(OSX_HEADERS_PATH)/net && curl -o $(OSX_HEADERS_PATH)/net/pfvar.h https://raw.githubusercontent.com/apple/darwin-xnu/master/bsd/net/pfvar.h
 $(OSX_HEADERS_PATH)/net/radix.h:
-	mkdir -p $(OSX_HEADERS_PATH)/net && curl -o $(OSX_HEADERS_PATH)/net/radix.h https://raw.githubusercontent.com/opensource-apple/xnu/$(OSX_VERSION)/bsd/net/radix.h
+	mkdir -p $(OSX_HEADERS_PATH)/net && curl -o $(OSX_HEADERS_PATH)/net/radix.h https://raw.githubusercontent.com/apple/darwin-xnu/master/bsd/net/radix.h
 $(OSX_HEADERS_PATH)/libkern/tree.h:
-	mkdir -p $(OSX_HEADERS_PATH)/libkern && curl -o $(OSX_HEADERS_PATH)/libkern/tree.h https://raw.githubusercontent.com/opensource-apple/xnu/$(OSX_VERSION)/libkern/libkern/tree.h
+	mkdir -p $(OSX_HEADERS_PATH)/libkern && curl -o $(OSX_HEADERS_PATH)/libkern/tree.h https://raw.githubusercontent.com/apple/darwin-xnu/master/libkern/libkern/tree.h
 endif
 
 $(DEPS): $(OSX_HEADERS) $(SRCS)

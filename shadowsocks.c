@@ -38,9 +38,6 @@ typedef struct ss_client_t {
     struct enc_ctx d_ctx;
     short e_ctx_init;
     short d_ctx_init;
-    bool  tfo;
-    size_t tfo_size;
-    char  tfo_buff[512];
 } ss_client;
 
 typedef struct ss_instance_t {
@@ -278,7 +275,6 @@ static void ss_relay_readcb(struct bufferevent *buffev, void *_arg)
 static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
 {
     redsocks_client *client = _arg;
-    ss_client *sclient = (void*)(client + 1);
 
     assert(buffev == client->relay);
     assert(client->state == ss_new);
@@ -309,9 +305,6 @@ static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
                                      ss_relay_writecb,
                                      redsocks_event_error,
                                      client);
-    if(!sclient->tfo) {
-        bufferevent_write(client->relay, &sclient->tfo_buff[0], sclient->tfo_size);
-    }
     // Write any data received from client side to relay.
     if (evbuffer_get_length(bufferevent_get_input(client->client)))
         ss_relay_writecb(client->relay, client);
@@ -325,9 +318,11 @@ static int ss_connect_relay(redsocks_client *client)
     char * interface = client->instance->config.interface;
     ss_client *sclient = (void*)(client + 1);
     ss_instance * ss = (ss_instance *)(client->instance+1);
-    ss_header_ipv4 header;
+    ss_header header;
     struct timeval tv;
     size_t len = 0;
+    size_t header_len = 0;
+    char buff[64+sizeof(header)];
 
     if (enc_ctx_init(&ss->info, &sclient->e_ctx, 1)) {
         log_error(LOG_ERR, "Shadowsocks failed to initialize encryption context.");
@@ -340,36 +335,55 @@ static int ss_connect_relay(redsocks_client *client)
         redsocks_drop_client(client);
         return -1;
     }
-    sclient->e_ctx_init = 1;
+    sclient->d_ctx_init = 1;
 
     /* build and send header */
-    // TODO: Better implementation and IPv6 Support
-    header.addr_type = ss_addrtype_ipv4;
-    header.addr = client->destaddr.sin_addr.s_addr;
-    header.port = client->destaddr.sin_port;
-    len += sizeof(header);
-    size_t sz = sizeof(sclient->tfo_buff);
-    if (!ss_encrypt(&sclient->e_ctx, (char *)&header, len, &sclient->tfo_buff[0], &sz)) {
+    if (client->destaddr.ss_family == AF_INET) {
+        struct sockaddr_in * addr = (struct sockaddr_in *)&client->destaddr;
+        header.v4.addr_type = ss_addrtype_ipv4;
+        header.v4.addr = addr->sin_addr.s_addr;
+        header.v4.port = addr->sin_port;
+        header_len = sizeof(ss_header_ipv4);
+    }
+    else if (client->destaddr.ss_family == AF_INET6) {
+        struct sockaddr_in6 * addr = (struct sockaddr_in6 *)&client->destaddr;
+        header.v6.addr_type = ss_addrtype_ipv6;
+        header.v6.addr = addr->sin6_addr;
+        header.v6.port = addr->sin6_port;
+        header_len = sizeof(ss_header_ipv6);
+    }
+    else {
+        log_error(LOG_ERR, "Unsupported address family: %d", client->destaddr.ss_family);
+        redsocks_drop_client(client);
+        return -1;
+    }
+    len += header_len;
+    size_t sz = sizeof(buff);
+    if (!ss_encrypt(&sclient->e_ctx, (char *)&header, len, &buff[0], &sz)) {
         log_error(LOG_ERR, "Encryption error.");
         redsocks_drop_client(client);
         return -1;
     }
-    sclient->tfo_size = len = sz;
+    len = sz;
 
     tv.tv_sec = client->instance->config.timeout;
     tv.tv_usec = 0;
-    client->relay = red_connect_relay_tfo(interface, &client->instance->config.relayaddr,
-                    NULL, ss_relay_connected, redsocks_event_error, client, 
-                    &tv, &sclient->tfo_buff[0], &sz);
+    client->relay = red_connect_relay_tfo(
+            interface,
+            &client->instance->config.relayaddr,
+            NULL,
+            ss_relay_connected,
+            redsocks_event_error,
+            client,
+            &tv,
+            &buff[0],
+            &sz);
 
     if (!client->relay) {
         redsocks_drop_client(client);
         return -1;
     }
-    if (sz && sz == len) {
-       sclient->tfo = true;
-    }
-    else if (sz) {
+    else if (sz && sz != len) {
         log_error(LOG_ERR, "Unexpected length of data sent.");
         redsocks_drop_client(client);
         return -1;
