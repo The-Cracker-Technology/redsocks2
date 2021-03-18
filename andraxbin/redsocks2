@@ -1,0 +1,5 @@
+#!/bin/bash
+
+cd /opt/ANDRAX/redsocks2/
+
+/opt/ANDRAX/redsocks2/redsocks2 "$@"
